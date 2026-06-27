@@ -50,7 +50,9 @@ type Page struct {
 // tracks outstanding crawls explicitly and returns as soon as the queue drains or
 // ctx is cancelled, leaving no goroutines behind.
 func (c *Crawler) Start(ctx context.Context, root *url.URL) []Page {
-	results := make(chan Page)
+	// Buffer results so finished crawls don't block waiting for the coordinator
+	// to catch up between dispatching new work.
+	results := make(chan Page, c.workers)
 	sem := make(chan struct{}, c.workers)
 
 	seen := map[string]struct{}{root.String(): {}}
