@@ -20,6 +20,7 @@ const testHTML = `<!DOCTYPE html>
 <p><a href=/next>Next page</a></p>
 <p><a href=/next>Next page</a></p>
 <p><a href=http://localhost/about>More page</a></p>
+<p><a href=http://localhost/page.html>HTML page</a></p>
 <p><a href=http://localhost/file.pdf>More page</a></p>
 <p><a href=http://localhost/terms#go-home>More page</a></p>
 <p><a href=http://otherlink.com/what>Nooooo</a></p>
@@ -35,12 +36,19 @@ func Test_ParseLinks(t *testing.T) {
 		want      []*url.URL
 		assertErr require.ErrorAssertionFunc
 	}{
-		"successfully extracts 3 links and ignores the rest and duplicates": {
+		"keeps in-domain HTML links, drops binaries, fragments, duplicates and external links": {
 			domain: urlMaker("http://localhost"),
 			data:   testHTML,
 			want: func() []*url.URL {
 				urls := []*url.URL{}
-				links := []string{"http://localhost/next", "http://localhost/about", "http://localhost/terms"}
+				// /file.pdf is dropped (binary), /page.html is kept (HTML),
+				// /terms#go-home loses its fragment, the rest are external/duplicate/traversal.
+				links := []string{
+					"http://localhost/next",
+					"http://localhost/about",
+					"http://localhost/page.html",
+					"http://localhost/terms",
+				}
 				for _, link := range links {
 					urls = append(urls, urlMaker(link))
 				}

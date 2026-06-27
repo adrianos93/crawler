@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -19,56 +18,41 @@ import (
 var (
 	rootURL     string
 	concurrency int
+	timeout     time.Duration
 )
 
 func init() {
-	flag.StringVar(&rootURL, "domain", "", "domain to crawl")
-	flag.IntVar(&concurrency, "concurrency", 5, "the amount of concurrent workers to spawn")
+	flag.StringVar(&rootURL, "domain", "", "domain to crawl (e.g. https://example.com)")
+	flag.IntVar(&concurrency, "concurrency", 5, "number of pages to crawl concurrently")
+	flag.DurationVar(&timeout, "timeout", 5*time.Second, "per-request HTTP timeout")
 }
 
 func main() {
 	flag.Parse()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// Logs go to stderr so stdout carries only crawl results and stays pipeable.
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	if rootURL == "" {
-		logger.Error("a valid URL for crawling must be provided")
+	if concurrency < 1 {
+		logger.Error("concurrency must be at least 1")
 		os.Exit(1)
-
-		if !strings.Contains(rootURL, "http://") || !strings.Contains(rootURL, "https://") {
-			logger.Error("url must contain a valid protocol. Either http or https")
-			os.Exit(1)
-		}
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	newReader := reader.New(5 * time.Second)
-
-	// this method will notify the downstream processes of a cancellation so that the work can be gracefully terminated
-	go func() {
-		c := make(chan os.Signal, 1)
-
-		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
-		<-c
-		cancel()
-	}()
 
 	domain, err := url.Parse(rootURL)
-	if err != nil {
-		logger.Error("parsing domain", "error", err)
+	if err != nil || domain.Scheme == "" || domain.Host == "" {
+		logger.Error("domain must be an absolute URL with a scheme and host, e.g. https://example.com", "domain", rootURL)
 		os.Exit(1)
 	}
 
-	crawl := crawler.New(logger, newReader, concurrency)
+	// Cancel the crawl on the first interrupt so in-flight work terminates gracefully.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	crawl := crawler.New(logger, reader.New(timeout), concurrency)
 
 	pages := crawl.Start(ctx, domain)
 
-	for i, page := range pages {
+	for _, page := range pages {
 		fmt.Printf("Page %s has links: %v\n", page.URL, page.Links)
-		if i == 5 {
-			break
-		}
 	}
 }
