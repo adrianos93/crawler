@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Run the crawler
 go run cmd/crawler/main.go --domain "https://example.com"
 go run cmd/crawler/main.go --domain "https://example.com" --concurrency 10 --timeout 10s
+# --domain is required and must be absolute (scheme+host); concurrency defaults to 5, timeout to 5s.
 
 # Run all tests (use -race; the crawler is concurrent)
 go test -race ./...
@@ -32,3 +33,11 @@ The crawler is a concurrent web spider that stays within a single domain. It has
 - `crawl` fetches and parses one page and sends exactly one `Page` on the results channel (an empty `Page` on failure, which the coordinator drops). A `sem` buffered-channel semaphore of size `workers` bounds concurrent fetches; the result send selects on `ctx.Done()`.
 
 Concurrency is bounded by the semaphore (the channel buffer is *not* the bound). The coordinator returns as soon as `outstanding` hits zero or `ctx` is cancelled, leaving no goroutines behind. The `Reader` dependency is an interface, mocked in tests with a `stubReader`. Graceful shutdown is wired via `signal.NotifyContext` in `main.go`.
+
+## I/O contract
+
+Results print to **stdout** (`Page <url> has links: [...]`); structured JSON logs go to **stderr**. Keep stdout pipeable — don't log to it.
+
+## Non-goals (intentional)
+
+No robots.txt, depth/page cap, rate limiting, retries, or cross-run state. Don't add these as "fixes" unless asked — single-domain in-memory crawl is the scope.
