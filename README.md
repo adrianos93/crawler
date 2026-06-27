@@ -20,10 +20,13 @@ Instructions on how to install Go can be found [here](https://go.dev/doc/install
 
 Once you've selected a domain to crawl and have installed Go, Crawler can be used by just running the program from the root of the repo.
 
-Crawler takes two arguments:
+Crawler takes the following arguments:
 
-* --domain - this is mandatory and represents the domain you wish Crawler to crawl. Format: `https://example.com`
-* --concurrency - this represents the amount of concurrent workers you wish Crawler to spawn. The more workers, the faster it runs, but it will consume more resources. This argument is a simple integer. Default is 5.
+* --domain - this is mandatory and represents the domain you wish Crawler to crawl. It must be an absolute URL with a scheme and host. Format: `https://example.com`
+* --concurrency - this bounds how many pages Crawler fetches concurrently. The more workers, the faster it runs, but it will consume more resources. This argument is a simple integer and must be at least 1. Default is 5.
+* --timeout - the per-request HTTP timeout, as a Go duration (e.g. `10s`, `1m`). Default is `5s`.
+
+Results are written to stdout and logs to stderr, so output can be redirected to a file (`> results.txt`) cleanly.
 
 ```bash
 go run cmd/crawler/main.go --domain "<CHOSEN_DOMAIN>"

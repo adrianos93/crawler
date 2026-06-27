@@ -1,123 +1,144 @@
 package crawler
 
 import (
-	"bytes"
-	"container/list"
 	"context"
 	"io"
 	"log/slog"
 	"net/url"
-	"sync"
+	"sort"
 
 	"github.com/adrianos93/crawler/internal/parser"
 )
 
-// Crawler is used to crawl webpages and populate a linked list with the extracted information
+// Crawler is used to crawl webpages and collect the links extracted from each one.
 type Crawler struct {
-	logger *slog.Logger
-	reader Reader
-	mw     int
+	logger  *slog.Logger
+	reader  Reader
+	workers int
 }
 
-// Reader is an interface so that Crawler can read the data provided from the given source
+// Reader fetches the content of a page as a stream. The caller closes the returned reader.
 type Reader interface {
-	ReadPage(ctx context.Context, location string, data io.Writer) error
+	Fetch(ctx context.Context, location string) (io.ReadCloser, error)
 }
 
-// New returns a Crawler
-func New(logger *slog.Logger, reader Reader, maxWorkers int) *Crawler {
+// New returns a Crawler. workers bounds the number of pages fetched concurrently
+// and is clamped to at least 1.
+func New(logger *slog.Logger, reader Reader, workers int) *Crawler {
+	if workers < 1 {
+		workers = 1
+	}
 	return &Crawler{
-		reader: reader,
-		mw:     maxWorkers,
-		logger: logger,
+		reader:  reader,
+		workers: workers,
+		logger:  logger,
 	}
 }
 
-// Page is a type used to hold the information extracted from a given page
+// Page holds a crawled page and the in-domain links discovered on it.
 type Page struct {
 	URL   string
 	Links []string
 }
 
-// Start is used to initiate the crawling process.
-// It takes a root URL and will trigger a couple of goroutines to crawl the extracted data.
-// It will create a buffered channel for the links, with a max buffer provided to the crawler to ensure concurrency is not unbounded.
-// Once all the data is extracted it will loop over the linked list on the Crawler and populate and return slice of Page
+// Start crawls every reachable in-domain page beginning at root and returns the
+// collected pages sorted by URL.
+//
+// A single coordinator goroutine owns the visited set and result slice, so no
+// locking is required. Each discovered URL is crawled in its own goroutine, but a
+// semaphore bounds how many fetches run at once to c.workers. The coordinator
+// tracks outstanding crawls explicitly and returns as soon as the queue drains or
+// ctx is cancelled, leaving no goroutines behind.
 func (c *Crawler) Start(ctx context.Context, root *url.URL) []Page {
+	// Buffer results so finished crawls don't block waiting for the coordinator
+	// to catch up between dispatching new work.
+	results := make(chan Page, c.workers)
+	sem := make(chan struct{}, c.workers)
+
+	seen := map[string]struct{}{root.String(): {}}
 	pages := []Page{}
-	pageChan := make(chan Page, c.mw)
+	outstanding := 0
 
-	data := list.New()
-
-	wg := &sync.WaitGroup{}
-
-	wg.Add(1)
-	go c.process(ctx, pageChan, wg, data)
-	go c.crawl(ctx, root, pageChan)
-	wg.Wait()
-
-	for e := data.Front(); e != nil; e = e.Next() {
-		pages = append(pages, e.Value.(Page))
-	}
-	return pages
-}
-
-// crawl will read in the given page and extract the links from the returned io.Writer
-// It will append the data to the linked list of the Crawler and send all the links to the links channel
-func (c *Crawler) crawl(ctx context.Context, page *url.URL, linksChan chan Page) {
-	crawledPage := Page{}
-	defer func() {
-		linksChan <- crawledPage
-	}()
-	var b bytes.Buffer
-	if err := c.reader.ReadPage(ctx, page.String(), &b); err != nil {
-		c.logger.Error("reading page", "error", err, "page", page.String())
-		return
-	}
-	links, err := parser.ParseLinks(page, &b)
-	if err != nil {
-		c.logger.Error("parsing links", "error", err, "page", page.String())
-		return
+	enqueue := func(u *url.URL) {
+		outstanding++
+		go c.crawl(ctx, u, sem, results)
 	}
 
-	crawledPage.URL = page.String()
-	if len(links) > 0 {
-		for _, link := range links {
-			crawledPage.Links = append(crawledPage.Links, link.String())
-		}
-	}
-}
+	enqueue(root)
 
-// process is another routine that reads from the links channel and will check if the url has been visited before.
-// If the URL has not been seen before, it will trigger another crawl goroutine and increment the wait group.
-// A receive from the channel counts as a crawl routine ending, so the wg counter is decremented.
-// It also honours context.Context, so before it attempts to receive from the channel, it will check for a cancellation and return early if it has been cancelled.
-// Due to having a local hashmap, only one instance of process can run at any given time to avoid locking.
-// It will also add the Page to the linked list for further processing.
-func (c *Crawler) process(ctx context.Context, nodeChan chan Page, wg *sync.WaitGroup, data *list.List) {
-	seen := make(map[string]struct{})
-	for {
+	for outstanding > 0 {
+		var page Page
 		select {
 		case <-ctx.Done():
-			return
-		// channel is never closed, so no point in checking for it.
-		case node := <-nodeChan:
-			data.PushBack(node)
-			for _, link := range node.Links {
-				if _, ok := seen[link]; !ok {
-					seen[link] = struct{}{}
+			// Abandon in-flight crawls; they observe ctx.Done() on their send and exit.
+			return sortPages(pages)
+		case page = <-results:
+		}
+		outstanding--
 
-					parsed, err := url.Parse(link)
-					if err != nil {
-						c.logger.Error("invalid link", "error", err)
-						continue
-					}
+		if page.URL != "" {
+			pages = append(pages, page)
+		}
 
-					wg.Add(1)
-					go c.crawl(ctx, parsed, nodeChan)
-				}
+		for _, link := range page.Links {
+			if _, ok := seen[link]; ok {
+				continue
 			}
-			wg.Done()
+			seen[link] = struct{}{}
+
+			parsed, err := url.Parse(link)
+			if err != nil {
+				c.logger.Error("invalid link", "error", err, "link", link)
+				continue
+			}
+			enqueue(parsed)
 		}
 	}
+
+	return sortPages(pages)
+}
+
+// crawl fetches and parses a single page, then sends exactly one Page on results so
+// the coordinator can account for it. On failure it sends a zero-value Page (empty
+// URL), which the coordinator drops. The send honours ctx so a cancelled crawl never
+// blocks forever.
+func (c *Crawler) crawl(ctx context.Context, u *url.URL, sem chan struct{}, results chan<- Page) {
+	page := Page{}
+	defer func() {
+		select {
+		case results <- page:
+		case <-ctx.Done():
+		}
+	}()
+
+	// Bound the number of concurrent fetches.
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	case <-ctx.Done():
+		return
+	}
+
+	body, err := c.reader.Fetch(ctx, u.String())
+	if err != nil {
+		c.logger.Warn("fetching page", "error", err, "page", u.String())
+		return
+	}
+	defer body.Close()
+
+	links, err := parser.ParseLinks(u, body)
+	if err != nil {
+		c.logger.Error("parsing links", "error", err, "page", u.String())
+		return
+	}
+
+	page.URL = u.String()
+	for _, link := range links {
+		page.Links = append(page.Links, link.String())
+	}
+}
+
+func sortPages(pages []Page) []Page {
+	sort.Slice(pages, func(i, j int) bool { return pages[i].URL < pages[j].URL })
+	return pages
 }

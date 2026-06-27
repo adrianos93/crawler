@@ -4,15 +4,26 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"regexp"
+	"path"
 	"strings"
 
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 )
 
-// regex to match file extensions
-var extensionRegEx = regexp.MustCompile(`\.[a-zA-Z0-9]+$`)
+// skipExtensions lists file extensions that are known not to be crawlable HTML.
+// A denylist is used deliberately: matching any trailing extension would discard
+// legitimate pages such as /index.html or /about.php.
+var skipExtensions = map[string]struct{}{
+	".pdf": {}, ".png": {}, ".jpg": {}, ".jpeg": {}, ".gif": {}, ".svg": {},
+	".webp": {}, ".ico": {}, ".bmp": {}, ".tiff": {},
+	".css": {}, ".js": {}, ".json": {}, ".xml": {}, ".rss": {},
+	".zip": {}, ".tar": {}, ".gz": {}, ".rar": {}, ".7z": {},
+	".mp3": {}, ".mp4": {}, ".avi": {}, ".mov": {}, ".webm": {}, ".wav": {},
+	".woff": {}, ".woff2": {}, ".ttf": {}, ".eot": {}, ".otf": {},
+	".doc": {}, ".docx": {}, ".xls": {}, ".xlsx": {}, ".ppt": {}, ".pptx": {},
+	".exe": {}, ".dmg": {}, ".iso": {}, ".bin": {},
+}
 
 // ParseLinks takes a given URL and will attempt to extract the links found in the data provide via the io.Reader.
 // The domain URL is used to filter out links not associated with it
@@ -65,8 +76,8 @@ func verifyAndFormatLink(page *url.URL, link string) *url.URL {
 		return nil
 	}
 
-	// avoid files (.pdf, .jpg)
-	if extensionRegEx.MatchString(parsedLink.Path) {
+	// avoid known non-HTML files (.pdf, .jpg, ...)
+	if _, skip := skipExtensions[strings.ToLower(path.Ext(parsedLink.Path))]; skip {
 		return nil
 	}
 
